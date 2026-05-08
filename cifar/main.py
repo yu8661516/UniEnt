@@ -28,12 +28,14 @@ parser.add_argument("--arch", default="Hendrycks2020AugMix_WRN",
                     choices=["Standard", "Hendrycks2020AugMix_WRN", "Hendrycks2020AugMix_ResNeXt"])
 # �7¼3 ÐÞ¸Ä1£ºÔÚadaptationµÄchoicesÖÐÌí¼Órunient
 parser.add_argument("--adaptation", default="tent",
-                    choices=["source", "norm", "cotta", "tent", "eata", "ostta", "runient"])
+                    choices=["source", "norm", "cotta", "tent", "eata", "ostta", "runient", "runient2"])
 parser.add_argument("--episodic", action="store_true")
 # Corruption options
 parser.add_argument("--dataset", default="cifar10", choices=["cifar10", "cifar100"])
 parser.add_argument("--type", default="gaussian_noise")
 parser.add_argument("--severity", default=5, type=int)
+parser.add_argument("--severity_list", nargs="+", default=[], type=int,
+                    help="Override severity list, e.g. --severity_list 1 3 5")
 parser.add_argument("--num_ex", default=10000, type=int)
 # Optimizer options
 parser.add_argument("--steps", default=1, type=int)
@@ -66,6 +68,13 @@ parser.add_argument("--window_size", type=int, default=200, help="»¬¶¯´°¿
 parser.add_argument("--delta", type=float, default=0.6, help="·Ö¶Î¼ÓÈ¨ÖÃÐÅ¶ÈãÐÖµ")
 parser.add_argument("--runient_alpha", type=float, default=0.5, help="±ß½çÑù±¾Ë¥¼õÒò×Ó£¨±ÜÃâÓëtentµÄalpha³åÍ»£©")
 parser.add_argument("--warmup_steps", type=int, default=5, help="GMMÔ¤ÈÈ²½Êý")
+parser.add_argument("--reset_per_corruption", action="store_true",
+                    help="Reset model state before each corruption type (independent evaluation)")
+# Ablation switches for RUniEnt2
+parser.add_argument("--use_ema",      action="store_true", help="Fix A: EMA-stabilised GMM statistics")
+parser.add_argument("--use_ood_marg", action="store_true", help="Fix B: OOD-aware marginal entropy")
+parser.add_argument("--use_proto",    action="store_true", help="Fix C: dynamic prototype update")
+parser.add_argument("--proto_drift_threshold", type=float, default=0.90, help="Drift constraint threshold for prototype update")
 
 args = parser.parse_args()
 args.type = ["gaussian_noise", "shot_noise", "impulse_noise",
@@ -73,8 +82,24 @@ args.type = ["gaussian_noise", "shot_noise", "impulse_noise",
              "snow", "frost", "fog", "brightness", "contrast",
              "elastic_transform", "pixelate", "jpeg_compression"]
 args.severity = [5]
+# Allow --severity_list to override for multi-severity experiments
+if hasattr(args, 'severity_list') and args.severity_list:
+    args.severity = args.severity_list
+
+# Build log filename
+_sev_tag = "sev" + "_".join(str(s) for s in args.severity)
 args.log_dest = "{}_{}_lr_{}_alpha_{}_{}.txt".format(
     args.adaptation, args.dataset, args.lr, "_".join(str(alpha) for alpha in args.alpha), args.criterion)
+# For runient2 ablation variants, append active fixes to log name
+if args.adaptation == "runient2":
+    fixes = ("A" if args.use_ema else "") + ("B" if args.use_ood_marg else "") + ("C" if args.use_proto else "")
+    fixes = fixes if fixes else "none"
+    args.log_dest = "runient2_{}_{}_bs{}_fixes{}_{}.txt".format(
+        args.dataset, args.lr, args.batch_size, fixes, _sev_tag)
+elif len(args.severity) > 1 or args.severity[0] != 5:
+    # non-default severity: tag the log name
+    base = args.log_dest.replace('.txt', '')
+    args.log_dest = f"{base}_{_sev_tag}.txt"
 args.ap = 0.92 if args.dataset == "cifar10" else 0.72
 args.e_margin = math.log(10)*0.40 if args.dataset == "cifar10" else math.log(100)*0.40
 args.d_margin = 0.4 if args.dataset == "cifar10" else 0.1
@@ -164,28 +189,63 @@ def evaluate():
                         delta=args.delta,
                         alpha=args.runient_alpha,
                         warmup_steps=args.warmup_steps)
+    elif args.adaptation == "runient2":
+        from runient2 import RUniEnt2
+        base_model = tent.configure_model(base_model)
+        params, param_names = tent.collect_params(base_model)
+        optimizer = setup_optimizer(params)
+        model = RUniEnt2(base_model, optimizer,
+                         steps=args.steps,
+                         episodic=args.episodic,
+                         ema_base_lr=2.0,
+                         proto_base_lr=0.002,
+                         proto_drift_threshold=args.proto_drift_threshold,
+                         delta=args.delta,
+                         ood_lambda=0.5,
+                         marg_lambda=0.1,
+                         warmup_steps=args.warmup_steps,
+                         use_ema=args.use_ema,
+                         use_ood_marg=args.use_ood_marg,
+                         use_proto=args.use_proto)
     # evaluate on each severity and type of corruption in turn
     for i in range(args.rounds):
         t = PrettyTable(["corruption", "acc", "auroc", "fpr95tpr", "oscr"])
         top1 = AverageMeter()
         auroc, fpr95tpr, oscr = AverageMeter(), AverageMeter(), AverageMeter()
         for severity in args.severity:
+            sev_top1 = AverageMeter()
+            sev_auroc, sev_fpr, sev_oscr = AverageMeter(), AverageMeter(), AverageMeter()
             for corruption_type in args.type:
-                # continual adaptation for all corruption
-                logger.info("not resetting model")
+                if args.adaptation in ("runient", "runient2"):
+                    model.reset_corruption()
+                    logger.info(f"resetting {args.adaptation} for [{corruption_type}{severity}]")
+                elif args.reset_per_corruption and hasattr(model, 'reset'):
+                    model.reset()
+                    logger.info(f"resetting model for [{corruption_type}{severity}]")
+                else:
+                    logger.info("not resetting model")
                 x_ind, y_ind = eval(f"load_{args.dataset}c")(args.num_ex,
                                                              severity, args.data_dir, False,
                                                              [corruption_type])
                 x_ood, _ = load_svhn_c(args.num_ex, severity, args.data_dir, False, [corruption_type])
+                # robustbench bug: y_ind may be longer than x_ind when n_examples > n_total_cifar
+                y_ind = y_ind[:x_ind.shape[0]]
+                # ensure x_ood matches x_ind length for correct OSCR computation
+                x_ood = x_ood[:x_ind.shape[0]]
                 x_ind, y_ind, x_ood = x_ind.cuda(), y_ind.cuda(), x_ood.cuda()
                 acc, (auc, fpr), oscr_ = get_results(model, x_ind, y_ind, x_ood, args.batch_size)
                 err = 1. - acc
                 logger.info(f"error % [{corruption_type}{severity}]: {err:.2%}")
                 t.add_row([f"{severity}/{corruption_type}", f"{acc:.2%}", f"{auc:.2%}", f"{fpr:.2%}", f"{oscr_:.2%}"])
-                top1.update(acc)
-                auroc.update(auc)
-                fpr95tpr.update(fpr)
-                oscr.update(oscr_)
+                top1.update(acc);  sev_top1.update(acc)
+                auroc.update(auc); sev_auroc.update(auc)
+                fpr95tpr.update(fpr); sev_fpr.update(fpr)
+                oscr.update(oscr_); sev_oscr.update(oscr_)
+            # per-severity mean row
+            if len(args.severity) > 1:
+                t.add_row([f"mean(sev={severity})",
+                           f"{sev_top1.avg:.2%}", f"{sev_auroc.avg:.2%}",
+                           f"{sev_fpr.avg:.2%}", f"{sev_oscr.avg:.2%}"])
         t.add_row(["mean", f"{top1.avg:.2%}", f"{auroc.avg:.2%}", f"{fpr95tpr.avg:.2%}", f"{oscr.avg:.2%}"])
         logger.info(f"results of round {i}:\n{t}")
 
@@ -229,8 +289,10 @@ def get_results(model: nn.Module,
             score_ind = torch.cat((score_ind, energy[:x_ind_curr.shape[0]].cpu()), dim=0)
             score_ood = torch.cat((score_ood, energy[x_ind_curr.shape[0]:].cpu()), dim=0)
             pred = torch.cat((pred, pred_[:x_ind_curr.shape[0]].cpu()), dim=0)
+    pred_np   = pred.numpy().astype(np.int64)
+    y_ind_np  = y_ind.cpu().numpy().astype(np.int64)
     return acc.item() / x_ind.shape[0], get_ood_metrics(y_true.numpy(), y_score.numpy()), \
-           get_oscr(score_ind.numpy(), score_ood.numpy(), pred.numpy(), y_ind.cpu().numpy())
+           get_oscr(score_ind.numpy(), score_ood.numpy(), pred_np, y_ind_np)
 
 def get_ood_metrics(y_true, y_score):
     auroc = metrics.roc_auc_score(y_true, y_score)
@@ -238,6 +300,9 @@ def get_ood_metrics(y_true, y_score):
     return auroc, float(interpolate.interp1d(tpr, fpr)(0.95))
 
 def get_oscr(score_ind, score_ood, pred, y_ind):
+    # force int64 to avoid elementwise comparison failure between float32 and uint8
+    pred  = np.array(pred,  dtype=np.int64)
+    y_ind = np.array(y_ind, dtype=np.int64)
     score = np.concatenate((score_ind, score_ood), axis=0)
     def get_fpr(t):
         return (score_ood >= t).sum() / len(score_ood)

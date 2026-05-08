@@ -70,8 +70,15 @@ def forward_and_adapt(x, model0, model, optimizer, alpha, criterion):
     outputs = model(x)
     if criterion != "ent":
         model1 = deepcopy(model0)
-        model1.fc = nn.Identity()
-        cos_sim = F.cosine_similarity(model1(x).unsqueeze(1), model.fc.weight, dim=2)
+        # support both WideResNet (.fc) and ResNeXt (.classifier)
+        if hasattr(model1, 'fc') and isinstance(model1.fc, nn.Linear):
+            _head = 'fc'
+        elif hasattr(model1, 'classifier') and isinstance(model1.classifier, nn.Linear):
+            _head = 'classifier'
+        else:
+            raise AttributeError("Cannot find Linear classifier head (tried 'fc' and 'classifier')")
+        setattr(model1, _head, nn.Identity())
+        cos_sim = F.cosine_similarity(model1(x).unsqueeze(1), getattr(model, _head).weight, dim=2)
         max_cos_sim, _ = cos_sim.max(1)
         min_value = max_cos_sim.min()
         max_value = max_cos_sim.max()
